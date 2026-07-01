@@ -21,6 +21,13 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from groq import Groq
 
+# Milestone 4 signal functions (Signal 2, Signal 3, ensemble engine).
+from detection_signals import (
+    calculate_combined_confidence,
+    entropy_score,
+    stylometric_score,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -140,11 +147,29 @@ def init_db():
                 llm_score   REAL    NOT NULL,
                 confidence  REAL    NOT NULL DEFAULT 0.0,
                 attribution TEXT    NOT NULL DEFAULT 'pending',
-                status      TEXT    NOT NULL DEFAULT 'classified'
+                status      TEXT    NOT NULL DEFAULT 'classified',
+                appeal_reasoning TEXT
             )
             """
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_appeal_reasoning():
+    """Add the appeal_reasoning column to an existing table if it's missing.
+
+    CREATE TABLE IF NOT EXISTS never alters an already-existing table, so a
+    database created before Milestone 5 won't have this column. We inspect the
+    live schema and ALTER only when needed. Idempotent — safe on every boot.
+    """
+    conn = get_db()
+    try:
+        cols = [row["name"] for row in conn.execute("PRAGMA table_info(audit_log)")]
+        if "appeal_reasoning" not in cols:
+            conn.execute("ALTER TABLE audit_log ADD COLUMN appeal_reasoning TEXT")
+            conn.commit()
     finally:
         conn.close()
 
@@ -180,9 +205,109 @@ def insert_record(content_id, creator_id, llm_score,
     }
 
 
+def update_appeal_in_db(content_id, reasoning):
+    """Flag a submission as appealed.
+
+    Sets status -> 'under_review' and stores the creator's reasoning. Returns
+    the updated row as a dict, or None if no row matches content_id.
+    """
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            """
+            UPDATE audit_log
+               SET status = 'under_review',
+                   appeal_reasoning = ?
+             WHERE content_id = ?
+            """,
+            (reasoning, content_id),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return None  # no matching content_id
+        row = conn.execute(
+            "SELECT * FROM audit_log WHERE content_id = ?", (content_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_analytics_from_db():
+    """Compute system-wide metrics from the audit log in a single pass.
+
+    Division-by-zero safe: an empty table yields zeroes across the board
+    rather than raising. Appeal rate counts rows that carry an
+    appeal_reasoning, so an appeal stays counted even after a reviewer later
+    moves the record to a resolved status.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*)                                                     AS total,
+                SUM(CASE WHEN appeal_reasoning IS NOT NULL THEN 1 ELSE 0 END) AS appeals,
+                AVG(confidence)                                              AS avg_conf
+            FROM audit_log
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+
+    total = row["total"] or 0
+    appeals = row["appeals"] or 0
+
+    if total == 0:
+        # Empty database — nothing to average or divide by.
+        return {
+            "total_submissions": 0,
+            "appeal_rate_percent": 0.0,
+            "average_confidence": 0.0,
+        }
+
+    return {
+        "total_submissions": total,
+        "appeal_rate_percent": round((appeals / total) * 100, 2),
+        "average_confidence": round(row["avg_conf"] or 0.0, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Transparency Label Routing (Milestone 5)
+# ---------------------------------------------------------------------------
+def get_transparency_label(score: float) -> str:
+    """Map a combined confidence score to its exact, verbatim label string.
+
+    Thresholds (from planning.md):
+        0.00 <= score < 0.35   -> Verified Human Work
+        0.35 <= score <= 0.65  -> Uncertain Attribution
+        0.65 <  score <= 1.00  -> AI-Generated Content
+    """
+    if score < 0.35:
+        return ("Verified Human Work: Our system has high confidence that this "
+                "content was entirely composed by a human creator.")
+    elif score <= 0.65:
+        return ("Uncertain Attribution: This content displays a mix of stylistic "
+                "signals. Our system cannot definitively classify its origin. "
+                "Originality remains unverified.")
+    else:
+        return ("AI-Generated Content: Our system detected strong structural and "
+                "linguistic patterns characteristic of automated language models.")
+
+
 # ---------------------------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def home():
+    """Return a simple landing message for the root URL."""
+    return jsonify({
+        "message": "Provenance Guard API is running.",
+        "endpoints": ["/submit", "/log", "/appeal", "/analytics"],
+    }), 200
+
+
 @app.route("/submit", methods=["POST"])
 # @limiter.limit("10/minute")  # FUTURE: enable once the rate limiter is wired
 def submit():
@@ -198,19 +323,36 @@ def submit():
 
     content_id = str(uuid.uuid4())
 
+    # --- Signal 1: LLM holistic analysis (Groq) ---------------------------
     try:
         llm_score = analyze_with_llm(text)
     except Exception as exc:  # network / API / config failure
         return jsonify({"error": f"LLM analysis failed: {exc}"}), 502
 
+    # --- Signals 2 & 3: local heuristics (no network, never raise) --------
+    stylometric = stylometric_score(text)
+    entropy = entropy_score(text)
+
+    # --- Ensemble: weighted combination + transparency label -------------
+    confidence = calculate_combined_confidence(llm_score, stylometric, entropy)
+    attribution = get_transparency_label(confidence)
+
     record = insert_record(
         content_id=content_id,
         creator_id=creator_id,
         llm_score=llm_score,
-        confidence=0.0,         # placeholder until ensemble engine (M4)
-        attribution="pending",  # placeholder until label logic (M5)
+        confidence=confidence,
+        attribution=attribution,
         status="classified",
     )
+
+    # Surface the per-signal breakdown alongside the stored record so callers
+    # can see how the confidence was composed.
+    record["signal_scores"] = {
+        "llm": llm_score,
+        "stylometric": stylometric,
+        "entropy": entropy,
+    }
 
     return jsonify(record), 201
 
@@ -239,10 +381,43 @@ def get_log():
     return jsonify([dict(row) for row in rows]), 200
 
 
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    """Accept {content_id, creator_reasoning} and flag the record for review."""
+    data = request.get_json(silent=True) or {}
+    content_id = data.get("content_id")
+    creator_reasoning = data.get("creator_reasoning")
+
+    if not content_id or not isinstance(content_id, str):
+        return jsonify({"error": "Field 'content_id' is required and must be a string."}), 400
+    if (not creator_reasoning or not isinstance(creator_reasoning, str)
+            or not creator_reasoning.strip()):
+        return jsonify({"error": "Field 'creator_reasoning' is required and must be a non-empty string."}), 400
+
+    record = update_appeal_in_db(content_id, creator_reasoning.strip())
+    if record is None:
+        return jsonify({"error": f"No submission found for content_id '{content_id}'."}), 404
+
+    return jsonify({
+        "message": "Appeal received. Submission is now under review.",
+        "content_id": content_id,
+        "status": record["status"],
+        "record": record,
+    }), 200
+
+
+@app.route("/analytics", methods=["GET"])
+def analytics():
+    """Return real-time system metrics (volume, appeal rate, avg confidence)."""
+    return jsonify(get_analytics_from_db()), 200
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-init_db()  # ensure the table exists at import time (covers `flask run` too)
+with app.app_context():
+    init_db()  # ensure the table exists securely within application context
+    migrate_add_appeal_reasoning()  # patch pre-Milestone-5 databases safely
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
